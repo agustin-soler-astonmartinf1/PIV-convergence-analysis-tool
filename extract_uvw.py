@@ -29,27 +29,39 @@ def parse_numeric_line(line):
     Try to parse a whitespace-separated numeric data line.
 
     Expected .dat row format:
-        x y z u v w ...
+        x y z u v w velmag flag ...
+
+    Only rows marked as ValidData (flag=3) are returned.
     """
     parts = line.strip().split()
 
-    if len(parts) < 6:
+    if len(parts) < 8:
         return None
 
     try:
-        values = [float(p) for p in parts[:6]]
+        values = [float(p) for p in parts[:8]]
     except ValueError:
         return None
 
-    return values  # x, y, z, u, v, w
+    x, y, z, u, v, w, _velmag, flag = values
+
+    if flag != 3.0:
+        return None
+
+    return x, y, z, u, v, w
 
 
 def extract_uvw_from_file(file_path, target_x, target_y, tol):
     """
-    Return (u, v, w) for the row matching target_x and target_y.
+    Return the selected valid vector for target_x and target_y.
 
-    Returns None if no matching point is found.
+    The returned tuple is (x, y, u, v, w).
+    If a row matches within tol on both axes, it is returned immediately.
+    Returns None only if the file contains no valid vectors.
     """
+    closest_vector = None
+    closest_distance_sq = None
+
     with file_path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             values = parse_numeric_line(line)
@@ -63,9 +75,15 @@ def extract_uvw_from_file(file_path, target_x, target_y, tol):
                 math.isclose(x, target_x, abs_tol=tol, rel_tol=0.0)
                 and math.isclose(y, target_y, abs_tol=tol, rel_tol=0.0)
             ):
-                return u, v, w
+                return x, y, u, v, w
 
-    return None
+            distance_sq = (x - target_x) ** 2 + (y - target_y) ** 2
+
+            if closest_distance_sq is None or distance_sq < closest_distance_sq:
+                closest_distance_sq = distance_sq
+                closest_vector = (x, y, u, v, w)
+
+    return closest_vector
 
 
 def main():
@@ -123,7 +141,7 @@ def main():
 
     with args.output_csv.open("w", newline="", encoding="utf-8") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["filename", "u", "v", "w"])
+        writer.writerow(["filename", "vector_x", "vector_y", "u", "v", "w"])
 
         for dat_file in dat_files:
             uvw = extract_uvw_from_file(
@@ -135,12 +153,12 @@ def main():
 
             if uvw is None:
                 if args.missing == "zero":
-                    row = [dat_file.name, 0.0, 0.0, 0.0]
+                    row = [dat_file.name, "", "", 0.0, 0.0, 0.0]
                 else:
-                    row = [dat_file.name, "", "", ""]
+                    row = [dat_file.name, "", "", "", "", ""]
             else:
-                u, v, w = uvw
-                row = [dat_file.name, u, v, w]
+                vector_x, vector_y, u, v, w = uvw
+                row = [dat_file.name, vector_x, vector_y, u, v, w]
 
             writer.writerow(row)
 
