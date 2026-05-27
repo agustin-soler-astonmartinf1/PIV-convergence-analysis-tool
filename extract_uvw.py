@@ -28,6 +28,20 @@ import math
 from pathlib import Path
 
 
+CSV_HEADER = [
+    "filename",
+    "requested_x",
+    "requested_y",
+    "match_status",
+    "match_distance",
+    "vector_x",
+    "vector_y",
+    "u",
+    "v",
+    "w",
+]
+
+
 def parse_numeric_line(line):
     """
     Try to parse a whitespace-separated numeric data line.
@@ -47,12 +61,95 @@ def parse_numeric_line(line):
     except ValueError:
         return None
 
-    x, y, z, u, v, w, _velmag, flag = values
+    x, y, z, u, v, w, velmag, flag = values
 
     if flag != 3.0:
         return None
 
-    return x, y, z, u, v, w
+    return {
+        "x": x,
+        "y": y,
+        "z": z,
+        "u": u,
+        "v": v,
+        "w": w,
+        "velmag": velmag,
+        "flag": int(flag),
+    }
+
+
+def load_valid_vectors(file_path):
+    """Load all valid vectors from one .dat file."""
+    vectors = []
+
+    with Path(file_path).open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            values = parse_numeric_line(line)
+
+            if values is not None:
+                vectors.append(values)
+
+    return vectors
+
+
+def vector_record_to_tuple(record):
+    """Convert a parsed vector record into the CSV/result tuple shape."""
+    return (record["x"], record["y"], record["u"], record["v"], record["w"])
+
+
+def extract_uvw_from_vectors(vectors, target_x, target_y, tol, fallback, max_distance):
+    """Select the best matching vector from an in-memory valid-vector list."""
+    closest_vector = None
+    closest_distance = None
+
+    for vector in vectors:
+        distance = math.hypot(vector["x"] - target_x, vector["y"] - target_y)
+
+        if (
+            math.isclose(vector["x"], target_x, abs_tol=tol, rel_tol=0.0)
+            and math.isclose(vector["y"], target_y, abs_tol=tol, rel_tol=0.0)
+        ):
+            return {
+                "status": "exact",
+                "distance": distance,
+                "vector": vector_record_to_tuple(vector),
+                "record": vector,
+            }
+
+        if closest_distance is None or distance < closest_distance:
+            closest_distance = distance
+            closest_vector = vector
+
+    if not vectors:
+        return {
+            "status": "no_valid_vectors",
+            "distance": None,
+            "vector": None,
+            "record": None,
+        }
+
+    if fallback == "nearest" and closest_vector is not None:
+        if max_distance is not None and closest_distance > max_distance:
+            return {
+                "status": "nearest_too_far",
+                "distance": closest_distance,
+                "vector": None,
+                "record": None,
+            }
+
+        return {
+            "status": "nearest",
+            "distance": closest_distance,
+            "vector": vector_record_to_tuple(closest_vector),
+            "record": closest_vector,
+        }
+
+    return {
+        "status": "no_match",
+        "distance": closest_distance,
+        "vector": None,
+        "record": None,
+    }
 
 
 def extract_uvw_from_file(file_path, target_x, target_y, tol, fallback, max_distance):
@@ -67,61 +164,174 @@ def extract_uvw_from_file(file_path, target_x, target_y, tol, fallback, max_dist
         distance: Euclidean distance from the requested point, if available
         vector: (x, y, u, v, w) for exact or nearest matches, otherwise None
     """
-    closest_vector = None
-    closest_distance = None
-    saw_valid_vector = False
+    vectors = load_valid_vectors(file_path)
+    return extract_uvw_from_vectors(
+        vectors,
+        target_x=target_x,
+        target_y=target_y,
+        tol=tol,
+        fallback=fallback,
+        max_distance=max_distance,
+    )
 
-    with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            values = parse_numeric_line(line)
 
-            if values is None:
-                continue
+def find_dat_files(folder):
+    """Return sorted .dat files from a folder, validating the folder first."""
+    folder = Path(folder)
 
-            saw_valid_vector = True
-            x, y, _z, u, v, w = values
-            distance = math.hypot(x - target_x, y - target_y)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"Input folder does not exist: {folder}")
 
-            if (
-                math.isclose(x, target_x, abs_tol=tol, rel_tol=0.0)
-                and math.isclose(y, target_y, abs_tol=tol, rel_tol=0.0)
-            ):
-                return {
-                    "status": "exact",
-                    "distance": distance,
-                    "vector": (x, y, u, v, w),
-                }
+    dat_files = sorted(folder.glob("*.dat"), key=lambda p: p.name)
 
-            if closest_distance is None or distance < closest_distance:
-                closest_distance = distance
-                closest_vector = (x, y, u, v, w)
+    if not dat_files:
+        raise FileNotFoundError(f"No .dat files found in folder: {folder}")
 
-    if not saw_valid_vector:
+    return dat_files
+
+
+def resolve_preview_source(path):
+    """Resolve a selected .dat file or folder into preview and batch paths."""
+    path = Path(path)
+
+    if path.is_dir():
+        dat_files = find_dat_files(path)
         return {
-            "status": "no_valid_vectors",
-            "distance": None,
-            "vector": None,
+            "folder": path,
+            "preview_file": dat_files[0],
+            "dat_files": dat_files,
         }
 
-    if fallback == "nearest" and closest_vector is not None:
-        if max_distance is not None and closest_distance > max_distance:
-            return {
-                "status": "nearest_too_far",
-                "distance": closest_distance,
-                "vector": None,
-            }
+    if path.is_file():
+        if path.suffix.lower() != ".dat":
+            raise ValueError(f"Selected file is not a .dat file: {path}")
 
+        dat_files = find_dat_files(path.parent)
         return {
-            "status": "nearest",
-            "distance": closest_distance,
-            "vector": closest_vector,
+            "folder": path.parent,
+            "preview_file": path,
+            "dat_files": dat_files,
         }
+
+    if path.suffix.lower() == ".dat":
+        raise FileNotFoundError(f"Selected .dat file does not exist: {path}")
+
+    raise FileNotFoundError(f"Selected path does not exist: {path}")
+
+
+def build_output_row(file_name, requested_x, requested_y, result, missing):
+    """Build one CSV row from an extraction result."""
+    distance = result["distance"]
+    row = [
+        file_name,
+        requested_x,
+        requested_y,
+        result["status"],
+        "" if distance is None else distance,
+    ]
+
+    if result["vector"] is None:
+        if missing == "zero":
+            row.extend(["", "", 0.0, 0.0, 0.0])
+        else:
+            row.extend(["", "", "", "", ""])
+
+        return row
+
+    vector_x, vector_y, u, v, w = result["vector"]
+    row.extend([vector_x, vector_y, u, v, w])
+    return row
+
+
+def extract_uvw_from_folder(
+    folder,
+    target_x,
+    target_y,
+    tol=1e-4,
+    missing="blank",
+    fallback="none",
+    max_distance=None,
+):
+    """Run extraction across every .dat file in a folder and return rows plus counts."""
+    dat_files = find_dat_files(folder)
+    rows = []
+    exact_count = 0
+    nearest_count = 0
+    missing_count = 0
+
+    for dat_file in dat_files:
+        result = extract_uvw_from_file(
+            dat_file,
+            target_x=target_x,
+            target_y=target_y,
+            tol=tol,
+            fallback=fallback,
+            max_distance=max_distance,
+        )
+
+        status = result["status"]
+
+        if status == "exact":
+            exact_count += 1
+        elif status == "nearest":
+            nearest_count += 1
+        else:
+            missing_count += 1
+
+        rows.append(
+            build_output_row(
+                dat_file.name,
+                requested_x=target_x,
+                requested_y=target_y,
+                result=result,
+                missing=missing,
+            )
+        )
 
     return {
-        "status": "no_match",
-        "distance": closest_distance,
-        "vector": None,
+        "folder": Path(folder),
+        "dat_files": dat_files,
+        "rows": rows,
+        "exact_count": exact_count,
+        "nearest_count": nearest_count,
+        "missing_count": missing_count,
     }
+
+
+def write_output_csv(output_csv, rows):
+    """Write extraction rows to a CSV file."""
+    output_csv = Path(output_csv)
+
+    with output_csv.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(CSV_HEADER)
+        writer.writerows(rows)
+
+    return output_csv
+
+
+def run_extraction(
+    folder,
+    target_x,
+    target_y,
+    output_csv,
+    tol=1e-4,
+    missing="blank",
+    fallback="none",
+    max_distance=None,
+):
+    """Run the batch extraction flow and write the resulting CSV."""
+    summary = extract_uvw_from_folder(
+        folder,
+        target_x=target_x,
+        target_y=target_y,
+        tol=tol,
+        missing=missing,
+        fallback=fallback,
+        max_distance=max_distance,
+    )
+    summary["output_csv"] = write_output_csv(output_csv, summary["rows"])
+    return summary
 
 
 def get_valid_coordinate_bounds(file_path):
@@ -131,24 +341,19 @@ def get_valid_coordinate_bounds(file_path):
     min_y = None
     max_y = None
 
-    with file_path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            values = parse_numeric_line(line)
+    for vector in load_valid_vectors(file_path):
+        x = vector["x"]
+        y = vector["y"]
 
-            if values is None:
-                continue
+        if min_x is None:
+            min_x = max_x = x
+            min_y = max_y = y
+            continue
 
-            x, y, _z, _u, _v, _w = values
-
-            if min_x is None:
-                min_x = max_x = x
-                min_y = max_y = y
-                continue
-
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_y = min(min_y, y)
-            max_y = max(max_y, y)
+        min_x = min(min_x, x)
+        max_x = max(max_x, x)
+        min_y = min(min_y, y)
+        max_y = max(max_y, y)
 
     if min_x is None:
         return None
@@ -218,73 +423,20 @@ def main():
     if args.max_distance is not None and args.max_distance < 0:
         raise ValueError("--max-distance must be non-negative")
 
-    if not args.folder.is_dir():
-        raise NotADirectoryError(f"Input folder does not exist: {args.folder}")
-
-    dat_files = sorted(args.folder.glob("*.dat"), key=lambda p: p.name)
-
-    if not dat_files:
-        raise FileNotFoundError(f"No .dat files found in folder: {args.folder}")
-
-    exact_count = 0
-    nearest_count = 0
-    missing_count = 0
-
-    with args.output_csv.open("w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(
-            [
-                "filename",
-                "requested_x",
-                "requested_y",
-                "match_status",
-                "match_distance",
-                "vector_x",
-                "vector_y",
-                "u",
-                "v",
-                "w",
-            ]
-        )
-
-        for dat_file in dat_files:
-            result = extract_uvw_from_file(
-                dat_file,
-                target_x=args.x,
-                target_y=args.y,
-                tol=args.tol,
-                fallback=args.fallback,
-                max_distance=args.max_distance,
-            )
-
-            status = result["status"]
-            distance = result["distance"]
-
-            if status == "exact":
-                exact_count += 1
-            elif status == "nearest":
-                nearest_count += 1
-            else:
-                missing_count += 1
-
-            row = [
-                dat_file.name,
-                args.x,
-                args.y,
-                status,
-                "" if distance is None else distance,
-            ]
-
-            if result["vector"] is None:
-                if args.missing == "zero":
-                    row.extend(["", "", 0.0, 0.0, 0.0])
-                else:
-                    row.extend(["", "", "", "", ""])
-            else:
-                vector_x, vector_y, u, v, w = result["vector"]
-                row.extend([vector_x, vector_y, u, v, w])
-
-            writer.writerow(row)
+    summary = run_extraction(
+        args.folder,
+        target_x=args.x,
+        target_y=args.y,
+        output_csv=args.output_csv,
+        tol=args.tol,
+        missing=args.missing,
+        fallback=args.fallback,
+        max_distance=args.max_distance,
+    )
+    dat_files = summary["dat_files"]
+    exact_count = summary["exact_count"]
+    nearest_count = summary["nearest_count"]
+    missing_count = summary["missing_count"]
 
     print(f"Processed {len(dat_files)} .dat files.")
     print(f"Exact matches: {exact_count}")
@@ -321,7 +473,7 @@ def main():
                     f"x={nearest_x}, y={nearest_y} "
                     f"(distance={nearest_result['distance']})."
                 )
-    print(f"Output written to: {args.output_csv}")
+    print(f"Output written to: {summary['output_csv']}")
 
 
 if __name__ == "__main__":
